@@ -66,44 +66,64 @@ namespace NeoLED {
 #define HUE_WHITE      0     // Use full brightness for white (no hue shift)
 #define HUE_OFF        0     // Turn off LED (set RGB values to zero)
 
-typedef struct {
-    uint8_t green;
-    uint8_t red;
-    uint8_t blue;
-} Pixel;
+    typedef struct
+    {
+        uint8_t green;
+        uint8_t red;
+        uint8_t blue;
+    } Pixel;
 
-void init();
-void update(Pixel* pixels); 
-void destroy();
+    void init();
+    void update(Pixel* pixels);
+    void destroy();
 
-inline Pixel makePixel(uint8_t r, uint8_t g, uint8_t b) {
-    Pixel pixel;
-    pixel.red = r;
-    pixel.green = g;
-    pixel.blue = b;
-    return pixel;
-}
-inline Pixel colorWheel(uint8_t hue) {
-     Pixel pixel;
-
-    if (hue < 85) {
-        pixel.red = hue * 3;
-        pixel.green = 255 - hue * 3;
-        pixel.blue = 0;
-    } else if (hue < 170) {
-        hue -= 85;
-        pixel.red = 255 - hue * 3;
-        pixel.green = 0;
-        pixel.blue = hue * 3;
-    } else {
-        hue -= 170;
-        pixel.red = 0;
-        pixel.green = hue * 3;
-        pixel.blue = 255 - hue * 3;
+    inline Pixel makePixel(uint8_t r, uint8_t g, uint8_t b)
+    {
+        Pixel pixel;
+        pixel.red = r;
+        pixel.green = g;
+        pixel.blue = b;
+        return pixel;
     }
+    inline Pixel colorWheel(uint8_t hue)
+    {
+        Pixel pixel;
 
-    return pixel;
-}
+        if (hue < 85)
+        {
+            pixel.red = hue * 3;
+            pixel.green = 255 - hue * 3;
+            pixel.blue = 0;
+        }
+        else if (hue < 170)
+        {
+            hue -= 85;
+            pixel.red = 255 - hue * 3;
+            pixel.green = 0;
+            pixel.blue = hue * 3;
+        }
+        else
+        {
+            hue -= 170;
+            pixel.red = 0;
+            pixel.green = hue * 3;
+            pixel.blue = 255 - hue * 3;
+        }
+
+        return pixel;
+    }
+    inline uint32_t hueValue(Pixel pixel)
+    {
+        return ((uint32_t)pixel.red << 16) | ((uint32_t)pixel.green << 8) | (uint32_t)pixel.blue;
+    }
+    inline Pixel RGBValue(uint32_t hueValue)
+    {
+        Pixel pixel;
+        pixel.red = (hueValue >> 16) & 0xFF;
+        pixel.green = (hueValue >> 8) & 0xFF;
+        pixel.blue = hueValue & 0xFF;
+        return pixel;
+    }
 } // namespace NeoLED
 
 #endif // NEOLED_H
