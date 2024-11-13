@@ -74,6 +74,7 @@ typedef struct {
 
 void init();
 void update(Pixel* pixels); 
+void destroy();
 
 inline Pixel makePixel(uint8_t r, uint8_t g, uint8_t b) {
     Pixel pixel;

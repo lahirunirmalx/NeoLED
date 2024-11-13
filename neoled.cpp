@@ -67,6 +67,11 @@ void init() {
     i2s_set_pin(static_cast<i2s_port_t>(I2S_NUM), &pin_config);
 }
 
+void  destroy() {
+    i2s_driver_uninstall(static_cast<i2s_port_t>(I2S_NUM));
+    gpio_reset_pin(static_cast<gpio_num_t>(I2S_DO_IO));
+}
+
 void update(Pixel* pixels) {
     size_t bytes_written = 0;
 
