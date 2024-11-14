@@ -112,16 +112,29 @@ namespace NeoLED {
 
         return pixel;
     }
-    inline uint32_t hueValue(Pixel pixel)
+    inline uint8_t hueValue(Pixel pixel)
+    {
+        if (pixel.red > 0 && pixel.blue == 0) { 
+        return pixel.red / 3;
+    }
+    if (pixel.red > 0 && pixel.green == 0) { 
+        return 85 + (255 - pixel.red) / 3;
+    }
+    if (pixel.green > 0 && pixel.red == 0) { 
+        return 170 + pixel.green / 3;
+    } 
+    return 0;
+    }
+     inline uint32_t hexValue(Pixel pixel)
     {
         return ((uint32_t)pixel.red << 16) | ((uint32_t)pixel.green << 8) | (uint32_t)pixel.blue;
     }
-    inline Pixel RGBValue(uint32_t hueValue)
+    inline Pixel RGBValue(uint32_t hexValue)
     {
         Pixel pixel;
-        pixel.red = (hueValue >> 16) & 0xFF;
-        pixel.green = (hueValue >> 8) & 0xFF;
-        pixel.blue = hueValue & 0xFF;
+        pixel.red = (hexValue >> 16) & 0xFF;
+        pixel.green = (hexValue >> 8) & 0xFF;
+        pixel.blue = hexValue & 0xFF;
         return pixel;
     }
 } // namespace NeoLED
