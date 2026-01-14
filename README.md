@@ -21,7 +21,7 @@ The WS2812 LEDs typically rely on precise timing signals, which can be challengi
 2. Add `NeoLED` to your project's `CMakeLists.txt`:
 
 ```cmake
-set(COMPONENT_SRCS "ws2812.cpp")
+set(COMPONENT_SRCS "neoled.cpp")
 set(COMPONENT_ADD_INCLUDEDIRS "include")
 register_component()
 ```
