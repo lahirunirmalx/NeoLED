@@ -25,8 +25,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
@@ -36,6 +38,7 @@
 #if NEOLED_USE_NEW_I2S_DRIVER
     // ESP-IDF 5.x uses new I2S driver
     #include "driver/i2s_std.h"
+    #include "soc/soc_caps.h"
 #else
     // ESP-IDF 4.x uses legacy I2S driver
     #include "driver/i2s.h"
@@ -46,68 +49,35 @@ static const char* TAG = "NeoLED";
 namespace NeoLED {
 
 // ============================================================================
-// Static Variables
+// Shared constants
 // ============================================================================
 
-static uint8_t out_buffer[LED_NUMBER * PIXEL_SIZE] = {0};
-static uint8_t off_buffer[ZERO_BUFFER] = {0};
-static uint16_t size_buffer = 0;
-static bool initialized = false;
-static uint8_t global_brightness = 255;
-static int current_gpio_pin = I2S_DO_IO;
-
-// Bit patterns for WS2812 timing via I2S
+// Bit patterns for WS2812 timing via I2S (2 LED bits per byte).
 static const uint16_t bitpatterns[4] = {0x88, 0x8e, 0xe8, 0xee};
 
-// ============================================================================
-// I2S Configuration (Version-specific)
-// ============================================================================
+// Reset/latch buffer is the same (all zeros) for every strip, so it can be
+// shared read-only across instances.
+static const uint8_t off_buffer[ZERO_BUFFER] = {0};
 
+// Number of usable I2S ports on this SoC.
 #if NEOLED_USE_NEW_I2S_DRIVER
-    // ESP-IDF 5.x: New I2S driver handle
-    static i2s_chan_handle_t tx_handle = NULL;
+    #define NEOLED_I2S_PORT_COUNT SOC_I2S_NUM
 #else
-    // ESP-IDF 4.x: Legacy I2S configuration
-    static i2s_config_t i2s_config = {
-        .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-        .communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_STAND_I2S | I2S_COMM_FORMAT_STAND_MSB),
-    #else
-        .communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
-    #endif
-        .intr_alloc_flags = 0,
-        .dma_buf_count = 4,
-        .dma_buf_len = LED_NUMBER * PIXEL_SIZE,
-        .use_apll = false,
-    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-        .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT,
-    #endif
-        .tx_desc_auto_clear = true
-    };
-
-    static i2s_pin_config_t pin_config = {
-    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-        .mck_io_num = I2S_PIN_NO_CHANGE,
-    #endif
-        .bck_io_num = I2S_PIN_NO_CHANGE,
-        .ws_io_num = I2S_PIN_NO_CHANGE,
-        .data_out_num = I2S_DO_IO,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
+    #define NEOLED_I2S_PORT_COUNT I2S_NUM_MAX
 #endif
 
+// Upper bound for the per-DMA-buffer length the I2S driver will accept.
+static const uint32_t NEOLED_DMA_LEN_MAX = 1020;
+
 // ============================================================================
-// Internal Helper Functions
+// Internal Helpers
 // ============================================================================
 
 /**
- * @brief Convert pixel data to I2S bit patterns
- * @param pixel Source pixel
- * @param buffer Output buffer (must be at least PIXEL_SIZE bytes)
- * @param brightness Brightness multiplier (0-255)
+ * @brief Convert one pixel into its 12-byte I2S bit-pattern representation.
+ * @param pixel      Source pixel.
+ * @param buffer     Output buffer (must hold at least PIXEL_SIZE bytes).
+ * @param brightness Brightness multiplier (0-255).
  */
 static void pixelToBitPattern(const Pixel& pixel, uint8_t* buffer, uint8_t brightness)
 {
@@ -117,57 +87,127 @@ static void pixelToBitPattern(const Pixel& pixel, uint8_t* buffer, uint8_t brigh
     uint8_t b = (uint8_t)((pixel.blue * brightness) / 255);
 
     // Green first (WS2812 uses GRB format)
-    buffer[0] = bitpatterns[g >> 6 & 0x03];
-    buffer[1] = bitpatterns[g >> 4 & 0x03];
-    buffer[2] = bitpatterns[g >> 2 & 0x03];
+    buffer[0] = bitpatterns[(g >> 6) & 0x03];
+    buffer[1] = bitpatterns[(g >> 4) & 0x03];
+    buffer[2] = bitpatterns[(g >> 2) & 0x03];
     buffer[3] = bitpatterns[g & 0x03];
 
     // Red
-    buffer[4] = bitpatterns[r >> 6 & 0x03];
-    buffer[5] = bitpatterns[r >> 4 & 0x03];
-    buffer[6] = bitpatterns[r >> 2 & 0x03];
+    buffer[4] = bitpatterns[(r >> 6) & 0x03];
+    buffer[5] = bitpatterns[(r >> 4) & 0x03];
+    buffer[6] = bitpatterns[(r >> 2) & 0x03];
     buffer[7] = bitpatterns[r & 0x03];
 
     // Blue
-    buffer[8] = bitpatterns[b >> 6 & 0x03];
-    buffer[9] = bitpatterns[b >> 4 & 0x03];
-    buffer[10] = bitpatterns[b >> 2 & 0x03];
+    buffer[8]  = bitpatterns[(b >> 6) & 0x03];
+    buffer[9]  = bitpatterns[(b >> 4) & 0x03];
+    buffer[10] = bitpatterns[(b >> 2) & 0x03];
     buffer[11] = bitpatterns[b & 0x03];
 }
 
+namespace {
+// RAII lock guard around an (opaque) FreeRTOS mutex. A null handle is a no-op,
+// so methods called before begin() simply skip locking.
+struct LockGuard {
+    SemaphoreHandle_t m;
+    explicit LockGuard(void* mtx) : m(static_cast<SemaphoreHandle_t>(mtx))
+    {
+        if (m) xSemaphoreTake(m, portMAX_DELAY);
+    }
+    ~LockGuard()
+    {
+        if (m) xSemaphoreGive(m);
+    }
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+};
+} // anonymous namespace
+
 // ============================================================================
-// Core Functions Implementation
+// Strip — construction / teardown
 // ============================================================================
 
-neoled_err_t init(void)
+Strip::Strip()
+    : port_(I2S_NUM),
+      gpio_(I2S_DO_IO),
+      led_count_(0),
+      size_buffer_(0),
+      out_buffer_(nullptr),
+      brightness_(255),
+      initialized_(false),
+      mutex_(nullptr),
+      tx_handle_(nullptr)
 {
-    return initWithPin(I2S_DO_IO);
 }
 
-neoled_err_t initWithPin(int gpio_pin)
+Strip::~Strip()
 {
-    if (initialized) {
-        ESP_LOGW(TAG, "Already initialized, call destroy() first");
+    end();
+    if (mutex_) {
+        vSemaphoreDelete(static_cast<SemaphoreHandle_t>(mutex_));
+        mutex_ = nullptr;
+    }
+}
+
+neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
+{
+    // Create the mutex on first use (kept for the lifetime of the object).
+    if (!mutex_) {
+        mutex_ = xSemaphoreCreateMutex();
+        if (!mutex_) {
+            ESP_LOGE(TAG, "Failed to create mutex");
+            return NEOLED_ERR_NO_MEM;
+        }
+    }
+
+    LockGuard lg(mutex_);
+
+    if (initialized_) {
+        ESP_LOGW(TAG, "Already initialized, call end() first");
         return NEOLED_OK;  // Already initialized is not an error
     }
 
-    size_buffer = LED_NUMBER * PIXEL_SIZE;
-    current_gpio_pin = gpio_pin;
+    if (led_count == 0) {
+        ESP_LOGE(TAG, "led_count must be >= 1");
+        return NEOLED_ERR_PARAM;
+    }
+
+    if (i2s_port < 0 || i2s_port >= NEOLED_I2S_PORT_COUNT) {
+        ESP_LOGE(TAG, "Invalid I2S port %d (this SoC has %d)", i2s_port, (int)NEOLED_I2S_PORT_COUNT);
+        return NEOLED_ERR_PARAM;
+    }
+
+    port_        = i2s_port;
+    gpio_        = gpio_pin;
+    led_count_   = led_count;
+    size_buffer_ = (uint16_t)(led_count * PIXEL_SIZE);
+
+    out_buffer_ = (uint8_t*)malloc(size_buffer_);
+    if (!out_buffer_) {
+        ESP_LOGE(TAG, "Failed to allocate %u byte frame buffer", (unsigned)size_buffer_);
+        return NEOLED_ERR_NO_MEM;
+    }
+
+    uint32_t dma_len = size_buffer_;
+    if (dma_len > NEOLED_DMA_LEN_MAX) dma_len = NEOLED_DMA_LEN_MAX;
+
     esp_err_t ret;
 
 #if NEOLED_USE_NEW_I2S_DRIVER
     // ESP-IDF 5.x: New I2S driver initialization
     i2s_chan_config_t chan_cfg = {
-        .id = (i2s_port_t)I2S_NUM,
+        .id = (i2s_port_t)port_,
         .role = I2S_ROLE_MASTER,
         .dma_desc_num = 4,
-        .dma_frame_num = LED_NUMBER * PIXEL_SIZE,
+        .dma_frame_num = dma_len,
         .auto_clear = true
     };
 
-    ret = i2s_new_channel(&chan_cfg, &tx_handle, NULL);
+    i2s_chan_handle_t handle = NULL;
+    ret = i2s_new_channel(&chan_cfg, &handle, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create I2S channel: %s", esp_err_to_name(ret));
+        free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 
@@ -203,183 +243,368 @@ neoled_err_t initWithPin(int gpio_pin)
         }
     };
 
-    ret = i2s_channel_init_std_mode(tx_handle, &std_cfg);
+    ret = i2s_channel_init_std_mode(handle, &std_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init I2S channel: %s", esp_err_to_name(ret));
-        i2s_del_channel(tx_handle);
-        tx_handle = NULL;
+        i2s_del_channel(handle);
+        free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 
-    ret = i2s_channel_enable(tx_handle);
+    ret = i2s_channel_enable(handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable I2S channel: %s", esp_err_to_name(ret));
-        i2s_del_channel(tx_handle);
-        tx_handle = NULL;
+        i2s_del_channel(handle);
+        free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 
+    tx_handle_ = handle;
 #else
     // ESP-IDF 4.x: Legacy I2S driver initialization
-    pin_config.data_out_num = gpio_pin;
+    i2s_config_t i2s_config = {
+        .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+        .communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_STAND_I2S | I2S_COMM_FORMAT_STAND_MSB),
+    #else
+        .communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    #endif
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 4,
+        .dma_buf_len = (int)dma_len,
+        .use_apll = false,
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+        .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT,
+    #endif
+        .tx_desc_auto_clear = true
+    };
 
-    ret = i2s_driver_install(static_cast<i2s_port_t>(I2S_NUM), &i2s_config, 0, nullptr);
+    i2s_pin_config_t pin_config = {
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+        .mck_io_num = I2S_PIN_NO_CHANGE,
+    #endif
+        .bck_io_num = I2S_PIN_NO_CHANGE,
+        .ws_io_num = I2S_PIN_NO_CHANGE,
+        .data_out_num = gpio_pin,
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+
+    ret = i2s_driver_install(static_cast<i2s_port_t>(port_), &i2s_config, 0, nullptr);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install I2S driver: %s", esp_err_to_name(ret));
+        free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 
-    ret = i2s_set_pin(static_cast<i2s_port_t>(I2S_NUM), &pin_config);
+    ret = i2s_set_pin(static_cast<i2s_port_t>(port_), &pin_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set I2S pins: %s", esp_err_to_name(ret));
-        i2s_driver_uninstall(static_cast<i2s_port_t>(I2S_NUM));
+        i2s_driver_uninstall(static_cast<i2s_port_t>(port_));
+        free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 #endif
 
-    initialized = true;
-    ESP_LOGI(TAG, "Initialized with GPIO %d, %d LEDs", gpio_pin, LED_NUMBER);
-    
-    // Clear LEDs on init
-    clear();
-    
-    return NEOLED_OK;
-}
+    initialized_ = true;
+    ESP_LOGI(TAG, "Initialized I2S%d on GPIO %d, %u LEDs", port_, gpio_pin, (unsigned)led_count_);
 
-neoled_err_t update(const Pixel* pixels)
-{
-    return updateWithBrightness(pixels, global_brightness);
-}
-
-neoled_err_t updateWithBrightness(const Pixel* pixels, uint8_t brightness)
-{
-    if (!initialized) {
-        ESP_LOGE(TAG, "Not initialized");
-        return NEOLED_ERR_NOT_INIT;
-    }
-
-    if (pixels == nullptr) {
-        ESP_LOGE(TAG, "Null pixel pointer");
-        return NEOLED_ERR_PARAM;
-    }
-
-    // Convert all pixels to bit patterns
-    for (uint16_t i = 0; i < LED_NUMBER; i++) {
-        int loc = i * PIXEL_SIZE;
-        pixelToBitPattern(pixels[i], &out_buffer[loc], brightness);
-    }
-
-    size_t bytes_written = 0;
-    esp_err_t ret;
-
-#if NEOLED_USE_NEW_I2S_DRIVER
-    // ESP-IDF 5.x: New I2S write
-    ret = i2s_channel_write(tx_handle, out_buffer, size_buffer, &bytes_written, portMAX_DELAY);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
-        return NEOLED_ERR_I2S;
-    }
-
-    ret = i2s_channel_write(tx_handle, off_buffer, ZERO_BUFFER, &bytes_written, portMAX_DELAY);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2S write (reset) failed: %s", esp_err_to_name(ret));
-        return NEOLED_ERR_I2S;
-    }
-#else
-    // ESP-IDF 4.x: Legacy I2S write
-    ret = i2s_write(static_cast<i2s_port_t>(I2S_NUM), out_buffer, size_buffer, &bytes_written, portMAX_DELAY);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
-        return NEOLED_ERR_I2S;
-    }
-
-    ret = i2s_write(static_cast<i2s_port_t>(I2S_NUM), off_buffer, ZERO_BUFFER, &bytes_written, portMAX_DELAY);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2S write (reset) failed: %s", esp_err_to_name(ret));
-        return NEOLED_ERR_I2S;
-    }
-#endif
-
-    // Small delay for data latch
+    // Clear LEDs on init (we already hold the lock, so fill+transmit directly).
+    memset(out_buffer_, bitpatterns[0], size_buffer_);
+    writeData();
+    writeReset();
     vTaskDelay(pdMS_TO_TICKS(1));
-
-#if NEOLED_USE_NEW_I2S_DRIVER
-    // Clear DMA buffer in new driver if needed
-#else
-    i2s_zero_dma_buffer(static_cast<i2s_port_t>(I2S_NUM));
-#endif
+    zeroDma();
 
     return NEOLED_OK;
 }
 
-neoled_err_t clear(void)
+neoled_err_t Strip::end(void)
 {
-    if (!initialized) {
-        return NEOLED_ERR_NOT_INIT;
+    LockGuard lg(mutex_);
+
+    if (!initialized_) {
+        return NEOLED_OK;  // Not an error to end when not initialized
     }
 
-    // Create array of off pixels
-    Pixel off_pixels[LED_NUMBER];
-    memset(off_pixels, 0, sizeof(off_pixels));
-    
-    return updateWithBrightness(off_pixels, 0);
-}
-
-neoled_err_t destroy(void)
-{
-    if (!initialized) {
-        return NEOLED_OK;  // Not an error to destroy when not initialized
-    }
-
-    // Turn off LEDs before destroying
-    clear();
+    // Turn off LEDs before tearing down.
+    memset(out_buffer_, bitpatterns[0], size_buffer_);
+    writeData();
+    writeReset();
+    vTaskDelay(pdMS_TO_TICKS(1));
+    zeroDma();
 
     esp_err_t ret;
 
 #if NEOLED_USE_NEW_I2S_DRIVER
-    // ESP-IDF 5.x: Cleanup new I2S driver
-    if (tx_handle != NULL) {
-        ret = i2s_channel_disable(tx_handle);
+    if (tx_handle_) {
+        i2s_chan_handle_t handle = static_cast<i2s_chan_handle_t>(tx_handle_);
+        ret = i2s_channel_disable(handle);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to disable I2S channel: %s", esp_err_to_name(ret));
         }
-
-        ret = i2s_del_channel(tx_handle);
+        ret = i2s_del_channel(handle);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to delete I2S channel: %s", esp_err_to_name(ret));
         }
-        tx_handle = NULL;
+        tx_handle_ = nullptr;
     }
 #else
-    // ESP-IDF 4.x: Cleanup legacy I2S driver
-    ret = i2s_driver_uninstall(static_cast<i2s_port_t>(I2S_NUM));
+    ret = i2s_driver_uninstall(static_cast<i2s_port_t>(port_));
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to uninstall I2S driver: %s", esp_err_to_name(ret));
     }
 #endif
 
-    // Reset GPIO pin
-    gpio_reset_pin(static_cast<gpio_num_t>(current_gpio_pin));
+    gpio_reset_pin(static_cast<gpio_num_t>(gpio_));
 
-    initialized = false;
-    ESP_LOGI(TAG, "Destroyed");
+    if (out_buffer_) {
+        free(out_buffer_);
+        out_buffer_ = nullptr;
+    }
+    size_buffer_ = 0;
+    initialized_ = false;
+    ESP_LOGI(TAG, "Strip on I2S%d destroyed", port_);
 
     return NEOLED_OK;
 }
 
+// ============================================================================
+// Strip — rendering
+// ============================================================================
+
+neoled_err_t Strip::fillBuffer(const Pixel* pixels, uint8_t brightness)
+{
+    for (uint16_t i = 0; i < led_count_; i++) {
+        pixelToBitPattern(pixels[i], &out_buffer_[i * PIXEL_SIZE], brightness);
+    }
+    return NEOLED_OK;
+}
+
+neoled_err_t Strip::writeData(void)
+{
+    size_t bytes_written = 0;
+    esp_err_t ret;
+#if NEOLED_USE_NEW_I2S_DRIVER
+    ret = i2s_channel_write(static_cast<i2s_chan_handle_t>(tx_handle_),
+                            out_buffer_, size_buffer_, &bytes_written, portMAX_DELAY);
+#else
+    ret = i2s_write(static_cast<i2s_port_t>(port_),
+                    out_buffer_, size_buffer_, &bytes_written, portMAX_DELAY);
+#endif
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
+        return NEOLED_ERR_I2S;
+    }
+    return NEOLED_OK;
+}
+
+neoled_err_t Strip::writeReset(void)
+{
+    size_t bytes_written = 0;
+    esp_err_t ret;
+#if NEOLED_USE_NEW_I2S_DRIVER
+    ret = i2s_channel_write(static_cast<i2s_chan_handle_t>(tx_handle_),
+                            off_buffer, ZERO_BUFFER, &bytes_written, portMAX_DELAY);
+#else
+    ret = i2s_write(static_cast<i2s_port_t>(port_),
+                    off_buffer, ZERO_BUFFER, &bytes_written, portMAX_DELAY);
+#endif
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2S write (reset) failed: %s", esp_err_to_name(ret));
+        return NEOLED_ERR_I2S;
+    }
+    return NEOLED_OK;
+}
+
+void Strip::zeroDma(void)
+{
+#if !NEOLED_USE_NEW_I2S_DRIVER
+    i2s_zero_dma_buffer(static_cast<i2s_port_t>(port_));
+#endif
+}
+
+neoled_err_t Strip::update(const Pixel* pixels)
+{
+    return updateWithBrightness(pixels, brightness_);
+}
+
+neoled_err_t Strip::updateWithBrightness(const Pixel* pixels, uint8_t brightness)
+{
+    LockGuard lg(mutex_);
+
+    if (!initialized_) {
+        ESP_LOGE(TAG, "Not initialized");
+        return NEOLED_ERR_NOT_INIT;
+    }
+    if (pixels == nullptr) {
+        ESP_LOGE(TAG, "Null pixel pointer");
+        return NEOLED_ERR_PARAM;
+    }
+
+    fillBuffer(pixels, brightness);
+
+    neoled_err_t e = writeData();
+    if (e != NEOLED_OK) return e;
+    e = writeReset();
+    if (e != NEOLED_OK) return e;
+
+    vTaskDelay(pdMS_TO_TICKS(1));  // data latch
+    zeroDma();
+    return NEOLED_OK;
+}
+
+neoled_err_t Strip::clear(void)
+{
+    LockGuard lg(mutex_);
+
+    if (!initialized_) {
+        return NEOLED_ERR_NOT_INIT;
+    }
+
+    // An all-zero pixel encodes to bitpatterns[0] for every byte.
+    memset(out_buffer_, bitpatterns[0], size_buffer_);
+
+    neoled_err_t e = writeData();
+    if (e != NEOLED_OK) return e;
+    e = writeReset();
+    if (e != NEOLED_OK) return e;
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+    zeroDma();
+    return NEOLED_OK;
+}
+
+bool     Strip::isInitialized(void) const { return initialized_; }
+void     Strip::setBrightness(uint8_t b)  { brightness_ = b; }
+uint8_t  Strip::getBrightness(void) const { return brightness_; }
+uint16_t Strip::numLeds(void) const       { return led_count_; }
+int      Strip::getGpioPin(void) const    { return gpio_; }
+int      Strip::getPort(void) const       { return port_; }
+
+// ============================================================================
+// Parallel multi-strip update
+// ============================================================================
+
+neoled_err_t updateParallel(Strip* const* strips, const Pixel* const* pixels, uint8_t count)
+{
+    if (!strips || !pixels || count == 0) {
+        return NEOLED_ERR_PARAM;
+    }
+
+    // Take every strip's lock up front (consistent order avoids deadlock when
+    // callers always pass strips in the same order).
+    for (uint8_t i = 0; i < count; i++) {
+        if (!strips[i]) return NEOLED_ERR_PARAM;
+        if (strips[i]->mutex_) {
+            xSemaphoreTake(static_cast<SemaphoreHandle_t>(strips[i]->mutex_), portMAX_DELAY);
+        }
+    }
+
+    neoled_err_t result = NEOLED_OK;
+
+    // Phase 1: render every buffer (pure CPU work).
+    for (uint8_t i = 0; i < count; i++) {
+        if (!strips[i]->initialized_) { result = NEOLED_ERR_NOT_INIT; break; }
+        if (!pixels[i])               { result = NEOLED_ERR_PARAM;    break; }
+        strips[i]->fillBuffer(pixels[i], strips[i]->brightness_);
+    }
+
+    // Phase 2: kick the DMA writes back-to-back. Each i2s write returns once
+    // the data is queued, so the peripherals transmit concurrently.
+    if (result == NEOLED_OK) {
+        for (uint8_t i = 0; i < count; i++) {
+            neoled_err_t e = strips[i]->writeData();
+            if (e != NEOLED_OK) result = e;
+        }
+        for (uint8_t i = 0; i < count; i++) {
+            neoled_err_t e = strips[i]->writeReset();
+            if (e != NEOLED_OK) result = e;
+        }
+        // A single latch delay covers all strips (they ran in parallel).
+        vTaskDelay(pdMS_TO_TICKS(1));
+        for (uint8_t i = 0; i < count; i++) {
+            strips[i]->zeroDma();
+        }
+    }
+
+    // Release locks in reverse order.
+    for (int i = (int)count - 1; i >= 0; i--) {
+        if (strips[i]->mutex_) {
+            xSemaphoreGive(static_cast<SemaphoreHandle_t>(strips[i]->mutex_));
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Default strip + backward-compatible free functions
+// ============================================================================
+
+static Strip g_default;
+
+neoled_err_t init(void)
+{
+    return g_default.begin(I2S_DO_IO, LED_NUMBER, I2S_NUM);
+}
+
+neoled_err_t initWithPin(int gpio_pin)
+{
+    return g_default.begin(gpio_pin, LED_NUMBER, I2S_NUM);
+}
+
+neoled_err_t update(const Pixel* pixels)
+{
+    return g_default.update(pixels);
+}
+
+neoled_err_t updateWithBrightness(const Pixel* pixels, uint8_t brightness)
+{
+    return g_default.updateWithBrightness(pixels, brightness);
+}
+
+neoled_err_t clear(void)
+{
+    return g_default.clear();
+}
+
+neoled_err_t destroy(void)
+{
+    return g_default.end();
+}
+
 bool isInitialized(void)
 {
-    return initialized;
+    return g_default.isInitialized();
 }
 
 void setBrightness(uint8_t brightness)
 {
-    global_brightness = brightness;
+    g_default.setBrightness(brightness);
 }
 
 uint8_t getBrightness(void)
 {
-    return global_brightness;
+    return g_default.getBrightness();
+}
+
+uint16_t numLeds(void)
+{
+    // Reports the compile-time build size for backward compatibility.
+    return LED_NUMBER;
+}
+
+int getGpioPin(void)
+{
+    return g_default.getGpioPin();
+}
+
+const char* version(void)
+{
+    return NEOLED_VERSION_STRING;
 }
 
 // ============================================================================
@@ -409,7 +634,7 @@ static const uint8_t gamma22_table[256] = {
 Pixel gammaCorrect(const Pixel& pixel, float gamma)
 {
     Pixel result;
-    
+
     if (gamma == 2.2f) {
         // Use lookup table for common gamma value
         result.red = gamma22_table[pixel.red];
@@ -421,7 +646,7 @@ Pixel gammaCorrect(const Pixel& pixel, float gamma)
         result.green = (uint8_t)(powf(pixel.green / 255.0f, gamma) * 255.0f + 0.5f);
         result.blue = (uint8_t)(powf(pixel.blue / 255.0f, gamma) * 255.0f + 0.5f);
     }
-    
+
     return result;
 }
 

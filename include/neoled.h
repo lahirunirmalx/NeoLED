@@ -28,9 +28,9 @@
 
 // Library version
 #define NEOLED_VERSION_MAJOR 1
-#define NEOLED_VERSION_MINOR 1
+#define NEOLED_VERSION_MINOR 3
 #define NEOLED_VERSION_PATCH 0
-#define NEOLED_VERSION_STRING "1.1.0"
+#define NEOLED_VERSION_STRING "1.3.0"
 
 // ESP-IDF version detection for compatibility
 #include "esp_idf_version.h"
@@ -109,43 +109,47 @@ typedef struct {
 } PixelW;
 
 // ============================================================================
-// Predefined Colors (in RGB order for user convenience)
-// These create Pixel structs with correct GRB internal ordering
+// Predefined Colors (values given in {green, red, blue} GRB storage order)
+// ============================================================================
+//
+// These are namespaced constexpr constants, so both qualified
+// (NeoLED::COLOR_RED) and unqualified (with `using namespace NeoLED`) use
+// compile cleanly. They replace the v1.1 preprocessor macros while keeping
+// the same names and values, so existing source continues to build.
+
+constexpr Pixel COLOR_RED       = {  0, 255,   0};
+constexpr Pixel COLOR_ORANGE    = { 64, 255,   0};
+constexpr Pixel COLOR_YELLOW    = {128, 255,   0};
+constexpr Pixel COLOR_LIME      = {255, 255,   0};
+constexpr Pixel COLOR_GREEN     = {255,   0,   0};
+constexpr Pixel COLOR_TURQUOISE = {255,   0, 128};
+constexpr Pixel COLOR_CYAN      = {255,   0, 255};
+constexpr Pixel COLOR_AQUA      = {128,   0, 255};
+constexpr Pixel COLOR_BLUE      = {  0,   0, 255};
+constexpr Pixel COLOR_PURPLE    = {  0, 128, 255};
+constexpr Pixel COLOR_MAGENTA   = {  0, 255, 255};
+constexpr Pixel COLOR_ROSE      = {  0, 255, 128};
+constexpr Pixel COLOR_WHITE     = {255, 255, 255};
+constexpr Pixel COLOR_OFF       = {  0,   0,   0};
+
+// ============================================================================
+// Predefined Hue Values (0-255 range, for use with colorWheel()/fromHSV())
 // ============================================================================
 
-#define COLOR_RED        (Pixel){0, 255, 0}
-#define COLOR_ORANGE     (Pixel){64, 255, 0}
-#define COLOR_YELLOW     (Pixel){128, 255, 0}
-#define COLOR_LIME       (Pixel){255, 255, 0}
-#define COLOR_GREEN      (Pixel){255, 0, 0}
-#define COLOR_TURQUOISE  (Pixel){255, 0, 128}
-#define COLOR_CYAN       (Pixel){255, 0, 255}
-#define COLOR_AQUA       (Pixel){128, 0, 255}
-#define COLOR_BLUE       (Pixel){0, 0, 255}
-#define COLOR_PURPLE     (Pixel){0, 128, 255}
-#define COLOR_MAGENTA    (Pixel){0, 255, 255}
-#define COLOR_ROSE       (Pixel){0, 255, 128}
-#define COLOR_WHITE      (Pixel){255, 255, 255}
-#define COLOR_OFF        (Pixel){0, 0, 0}
-
-// ============================================================================
-// Predefined Hue Values (0-255 range)
-// ============================================================================
-
-#define HUE_RED        0      // Red
-#define HUE_ORANGE     32     // Orange
-#define HUE_YELLOW     64     // Yellow
-#define HUE_LIME       80     // Lime Green
-#define HUE_GREEN      96     // Green
-#define HUE_TURQUOISE  112    // Turquoise
-#define HUE_CYAN       128    // Cyan
-#define HUE_AQUA       144    // Aqua Blue
-#define HUE_BLUE       160    // Blue
-#define HUE_PURPLE     176    // Purple
-#define HUE_MAGENTA    192    // Magenta (Pink)
-#define HUE_ROSE       224    // Rose Pink
-#define HUE_WHITE      0      // Use full brightness for white (no hue shift)
-#define HUE_OFF        0      // Turn off LED (set RGB values to zero)
+constexpr uint8_t HUE_RED       = 0;    // Red
+constexpr uint8_t HUE_ORANGE    = 32;   // Orange
+constexpr uint8_t HUE_YELLOW    = 64;   // Yellow
+constexpr uint8_t HUE_LIME      = 80;   // Lime Green
+constexpr uint8_t HUE_GREEN     = 96;   // Green
+constexpr uint8_t HUE_TURQUOISE = 112;  // Turquoise
+constexpr uint8_t HUE_CYAN      = 128;  // Cyan
+constexpr uint8_t HUE_AQUA      = 144;  // Aqua Blue
+constexpr uint8_t HUE_BLUE      = 160;  // Blue
+constexpr uint8_t HUE_PURPLE    = 176;  // Purple
+constexpr uint8_t HUE_MAGENTA   = 192;  // Magenta (Pink)
+constexpr uint8_t HUE_ROSE      = 224;  // Rose Pink
+constexpr uint8_t HUE_WHITE     = 0;    // Use full brightness for white (no hue shift)
+constexpr uint8_t HUE_OFF       = 0;    // Turn off LED (set RGB values to zero)
 
 // ============================================================================
 // Core Functions
@@ -208,6 +212,111 @@ void setBrightness(uint8_t brightness);
  * @return Current brightness (0-255)
  */
 uint8_t getBrightness(void);
+
+/**
+ * @brief Get the number of LEDs the library is built for
+ * @return LED count (compile-time LED_NUMBER)
+ */
+uint16_t numLeds(void);
+
+/**
+ * @brief Get the GPIO pin currently used for data output
+ * @return GPIO pin number (valid after a successful init)
+ */
+int getGpioPin(void);
+
+/**
+ * @brief Get the library version string
+ * @return Version string (e.g. "1.2.0")
+ */
+const char* version(void);
+
+// ============================================================================
+// Strip Class — multi-instance API for multiple I2S channels
+// ============================================================================
+//
+// The free functions above drive a single built-in default strip and are kept
+// unchanged for backward compatibility. To drive more than one independent
+// strip — e.g. one per I2S peripheral, updated in parallel and/or from
+// different CPU cores — create one Strip per data line. Each Strip owns its
+// own I2S channel, frame buffer, brightness, and mutex, so instances are
+// independent and safe to use concurrently from separate tasks/cores.
+//
+// Hardware limit: the number of usable I2S ports is SoC-dependent (ESP32 and
+// ESP32-S3 have 2; S2/C3/C6/H2 have 1). begin() returns NEOLED_ERR_PARAM for
+// an out-of-range port.
+
+class Strip {
+public:
+    Strip();
+    ~Strip();
+
+    // Non-copyable: a Strip owns hardware, a heap buffer, and a mutex.
+    Strip(const Strip&) = delete;
+    Strip& operator=(const Strip&) = delete;
+
+    /**
+     * @brief Initialize this strip on a given GPIO and I2S port.
+     * @param gpio_pin  Data output GPIO.
+     * @param led_count Number of LEDs on this strip (must be >= 1).
+     * @param i2s_port  I2S peripheral index (defaults to I2S_NUM).
+     * @return NEOLED_OK, or NEOLED_ERR_PARAM / NEOLED_ERR_NO_MEM / NEOLED_ERR_I2S.
+     */
+    neoled_err_t begin(int gpio_pin, uint16_t led_count, int i2s_port = I2S_NUM);
+
+    /** @brief Release the I2S channel and frame buffer, and reset the GPIO. */
+    neoled_err_t end(void);
+
+    bool isInitialized(void) const;
+
+    neoled_err_t update(const Pixel* pixels);
+    neoled_err_t updateWithBrightness(const Pixel* pixels, uint8_t brightness);
+    neoled_err_t clear(void);
+
+    void     setBrightness(uint8_t brightness);
+    uint8_t  getBrightness(void) const;
+    uint16_t numLeds(void) const;
+    int      getGpioPin(void) const;
+    int      getPort(void) const;
+
+private:
+    neoled_err_t fillBuffer(const Pixel* pixels, uint8_t brightness);
+    neoled_err_t writeData(void);
+    neoled_err_t writeReset(void);
+    void         zeroDma(void);
+
+    friend neoled_err_t updateParallel(Strip* const* strips,
+                                       const Pixel* const* pixels,
+                                       uint8_t count);
+
+    int      port_;
+    int      gpio_;
+    uint16_t led_count_;
+    uint16_t size_buffer_;
+    uint8_t* out_buffer_;
+    uint8_t  brightness_;
+    bool     initialized_;
+    void*    mutex_;       // SemaphoreHandle_t (opaque to keep header light)
+    void*    tx_handle_;   // i2s_chan_handle_t on ESP-IDF 5.x; unused on 4.x
+};
+
+/**
+ * @brief Update several strips so their transmissions overlap (parallel DMA).
+ *
+ * Each strip's buffer is filled first, then the DMA writes are issued
+ * back-to-back. Because every I2S peripheral transmits independently in the
+ * background, the strips refresh effectively at the same time. Each strip is
+ * rendered at its own brightness.
+ *
+ * Call this from a single coordinator task and pass distinct, already-begun
+ * Strip pointers (passing the same Strip twice would deadlock its mutex).
+ *
+ * @param strips Array of Strip pointers.
+ * @param pixels Array of pixel arrays; pixels[i] feeds strips[i].
+ * @param count  Number of strips.
+ * @return NEOLED_OK, or the first error encountered.
+ */
+neoled_err_t updateParallel(Strip* const* strips, const Pixel* const* pixels, uint8_t count);
 
 // ============================================================================
 // Pixel Creation Functions (Inline for performance)
