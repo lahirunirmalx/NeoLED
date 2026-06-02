@@ -1,26 +1,39 @@
 # NeoLED - ESP32 Component for WS2812 LEDs Using I2S
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/yourusername/neoled)
+[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/lahirunirmalx/NeoLED)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-4.x%20%7C%205.x-orange.svg)](https://docs.espressif.com/projects/esp-idf/)
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-4.4%20–%205.x-orange.svg)](https://docs.espressif.com/projects/esp-idf/)
+[![CI](https://github.com/lahirunirmalx/NeoLED/actions/workflows/ci.yml/badge.svg)](https://github.com/lahirunirmalx/NeoLED/actions/workflows/ci.yml)
 
 ## Introduction
 
-NeoLED is an ESP32 component library designed specifically for controlling WS2812 NeoPixel LEDs using the I2S peripheral of the ESP-IDF SDK. This library was created to fill the gap when a suitable existing library was not found, particularly for use in the M5Stack Cardputer, where GPIO control via I2S is essential for reliable LED performance.
+NeoLED is an ESP32 component library for driving WS2812 / NeoPixel LEDs (and SK6812, WS2813/15, and common clones) using the **I2S peripheral** of the ESP-IDF SDK. It was created for the M5Stack Cardputer, where reliable LED timing via I2S is essential, and has grown into a general-purpose driver with both a C++ and a C API.
 
 ### Why Use I2S for NeoPixels?
 
-The WS2812 LEDs typically rely on precise timing signals, which can be challenging to achieve with regular GPIO operations, especially on the ESP32 when running other tasks concurrently. By leveraging the I2S peripheral, NeoLED can generate the necessary timing signals more accurately, reducing flicker and glitches even under heavy CPU load.
+WS2812 LEDs rely on precise timing that is hard to achieve with bit-banged GPIO, especially when the ESP32 is busy with WiFi or other tasks. Driving them from the **I2S peripheral with DMA** produces rock-solid timing with no flicker even under heavy CPU load — and frees you to run two strips in true parallel on the two I2S channels.
 
 ## Features
 
-- **ESP-IDF 4.x & 5.x Compatible**: Automatic detection and support for both legacy and new I2S drivers
-- **Reliable I2S Control**: Ensures stable operation of WS2812 LEDs using I2S peripheral for precise timing
-- **Customizable GPIO**: Defaults to GPIO 21, configurable at compile-time or runtime
-- **Brightness Control**: Global brightness setting with per-update brightness override
-- **Color Utilities**: HSV conversion, color wheel, gamma correction, and color blending
-- **Error Handling**: Comprehensive error codes and logging for easier debugging
-- **Simple API**: Easy-to-use API for initializing, setting pixel colors, and updating the LED strip
+- **Reliable I2S + DMA timing** — stable WS2812 output even under heavy CPU/WiFi load.
+- **ESP-IDF 4.4 – 5.x** — auto-detects the legacy and new I2S drivers; CI-built across versions and targets.
+- **Multiple parallel strips** — one `Strip` per I2S channel, refreshed together with `updateParallel()`; **multicore-safe** (per-instance mutex).
+- **Configurable color order** (GRB/RGB/BRG/…) and **RGBW** (SK6812-RGBW) support.
+- **Runtime LED count** — sized at `begin()`, no recompile (or compile-time via the default API).
+- **C++ and C APIs** — `neoled.h` for C++, `neoled_c.h` for plain-C projects.
+- **Per-pixel framebuffer** — `setPixel`/`fill`/`getPixel`/`show`, plus brightness control.
+- **Color utilities** — HSV, color wheel, gamma correction, blending, hex conversion.
+- **Robust** — comprehensive error codes, logging, bounds checks, and host unit tests.
+
+## Contents
+
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [API Reference](#api-reference) — [Strip class / parallel / multicore](#multiple-strips-parallel--multicore-strip-class), [color order, RGBW & per-pixel](#color-order-rgbw--per-pixel-api), [C API](#c-api-neoled_ch)
+- [Usage Examples](#usage-examples) — see also [`examples/`](examples/)
+- [Compatible LED Chips](#compatible-led-chips)
+- [Known Issues](#known-issues) · [Planned Improvements](#planned-improvements) · [Debugging Tips](#debugging-tips)
+- [Changelog](#changelog)
 
 ## Installation
 
