@@ -102,7 +102,70 @@ NeoLED::neoled_err_t NeoLED::clear(void);
 // Set/get global brightness
 void NeoLED::setBrightness(uint8_t brightness);
 uint8_t NeoLED::getBrightness(void);
+
+// Introspection
+uint16_t NeoLED::numLeds(void);      // LED count the library was built for
+int NeoLED::getGpioPin(void);        // active data GPIO (valid after init)
+const char* NeoLED::version(void);   // e.g. "1.2.0"
 ```
+
+> **Thread safety:** The default free-function API is mutex-protected, so
+> `update()` / `clear()` are safe to call from multiple tasks. For independent
+> strips driven concurrently, prefer separate `Strip` instances (below).
+
+### Multiple Strips, Parallel & Multicore (`Strip` class)
+
+For more than one independent strip — one per I2S peripheral, refreshed in
+parallel and/or from different cores — create a `NeoLED::Strip` per data line.
+Each instance owns its I2S port, frame buffer, brightness, and mutex.
+
+```cpp
+namespace NeoLED {
+class Strip {
+public:
+    // Initialize on a GPIO + I2S port with a runtime LED count.
+    neoled_err_t begin(int gpio_pin, uint16_t led_count, int i2s_port = I2S_NUM);
+    neoled_err_t end(void);
+    bool isInitialized(void) const;
+
+    neoled_err_t update(const Pixel* pixels);
+    neoled_err_t updateWithBrightness(const Pixel* pixels, uint8_t brightness);
+    neoled_err_t clear(void);
+
+    void     setBrightness(uint8_t brightness);
+    uint8_t  getBrightness(void) const;
+    uint16_t numLeds(void) const;
+    int      getGpioPin(void) const;
+    int      getPort(void) const;
+};
+
+// Update several strips so their DMA transfers overlap (refresh together).
+neoled_err_t updateParallel(Strip* const* strips,
+                            const Pixel* const* pixels,
+                            uint8_t count);
+}
+```
+
+```cpp
+NeoLED::Strip s0, s1;
+s0.begin(21, 16, /*i2s_port=*/0);
+s1.begin(22, 16, /*i2s_port=*/1);
+
+NeoLED::Strip* strips[]       = { &s0, &s1 };
+const NeoLED::Pixel* frames[] = { frame0, frame1 };
+NeoLED::updateParallel(strips, frames, 2);   // both strips light up together
+```
+
+Notes:
+- The number of parallel strips is limited by the SoC's I2S peripheral count
+  (ESP32 / ESP32-S3: 2; S2 / C3 / C6 / H2: 1). `begin()` returns
+  `NEOLED_ERR_PARAM` for an out-of-range port.
+- `begin()` allocates a `led_count * 12`-byte buffer; it returns
+  `NEOLED_ERR_NO_MEM` if allocation fails.
+- Call `updateParallel()` from a single coordinator task and pass **distinct**
+  strips (passing one twice would deadlock its mutex).
+- For per-core rendering, give each core its own `Strip` and task — see
+  [`examples/05_multicore`](examples/05_multicore/main.cpp).
 
 ### Pixel Creation
 
@@ -158,6 +221,11 @@ COLOR_WHITE, COLOR_OFF
 ```
 
 ## Usage Examples
+
+> Runnable, copy-paste examples live in [`examples/`](examples/): a
+> [single LED](examples/01_single_led/main.cpp), multiple
+> [chained strips](examples/02_strip_segments/main.cpp), and an
+> [8×8 matrix](examples/03_matrix/main.cpp).
 
 ### Basic Usage
 
@@ -286,6 +354,21 @@ extern "C" void app_main() {
 
 ## Changelog
 
+### v1.3.0
+- **Multiple I2S channels / parallel strips.** New `NeoLED::Strip` class — one instance per data line, each with its own I2S port, frame buffer, brightness, and mutex. Drive several independent strips at once with `NeoLED::updateParallel()` (up to the SoC's I2S peripheral count: 2 on ESP32 / ESP32-S3, 1 on S2/C3/C6/H2).
+- **Multicore-safe.** Each `Strip` is independent and mutex-protected, so different strips can be rendered from tasks pinned to different cores (see `examples/05_multicore`). The default free-function API is now mutex-protected too.
+- **Runtime LED count.** `Strip::begin(gpio, led_count, port)` sizes its buffer at runtime (heap-allocated), so LED count no longer has to be a compile-time constant for the instance API.
+- Backward compatible: the existing free functions (`init`, `update`, `clear`, …) are unchanged and now simply wrap a built-in default `Strip`.
+- Added `examples/04_parallel_strips` and `examples/05_multicore`.
+
+### v1.2.0
+- Predefined `COLOR_*` and `HUE_*` are now namespaced `constexpr` constants instead of macros, so both `NeoLED::COLOR_RED` and (with `using namespace NeoLED`) `COLOR_RED` compile. Same names and values — existing code keeps working.
+- Added `numLeds()`, `getGpioPin()`, and `version()` accessors.
+- `clear()` no longer allocates a per-LED array on the stack (safe for large `LED_NUMBER`).
+- Refactored the I2S transmit path into a single shared helper, removing duplicated write logic between `update()` and `clear()`.
+- Added the missing `LICENSE` file and fixed `.gitignore` (was `.gitignore.txt`).
+- Added runnable examples under `examples/` (single LED, chained strips, 8×8 matrix) and a "Compatible LED Chips" reference for WS2812 clones/variants.
+
 ### v1.1.0
 - Added ESP-IDF 5.x support with automatic version detection
 - Added `initWithPin()` for runtime GPIO configuration
@@ -307,16 +390,41 @@ extern "C" void app_main() {
 - Basic WS2812 LED control via I2S
 - Color wheel and basic pixel utilities
 
+## Compatible LED Chips
+
+NeoLED generates a fixed **single-wire ~800 kHz NRZ** signal in **GRB** order,
+3 bytes per pixel. Any addressable LED that speaks that protocol works — these
+are the common WS2812 "clones" and relatives:
+
+| Chip | Works | Notes |
+|------|-------|-------|
+| WS2812 / WS2812B / WS2812C / WS2812D | ✅ | Reference part this library targets. |
+| WS2813 | ✅ | Dual-signal (backup data) version, same protocol. |
+| WS2815 | ✅ | 12 V strip, same data timing/order — just power it from 12 V. |
+| SK6812 (RGB) | ✅ | WS2812-compatible timing and GRB order. |
+| SK6805 | ✅ | Smaller SK6812 family member. |
+| WS2811 | ⚠️ | 800 kHz mode usually works, but many are **RGB** order — swap R/G (below). |
+| PL9823 | ⚠️ | 800 kHz single-wire, but **RGB** order — swap R/G. |
+| APA106 | ⚠️ | Through-hole, **RGB** order — swap R/G. |
+| SK6812-**RGBW** | ❌ | 4 bytes/pixel (W channel) — not supported yet (RGB only). |
+| APA102 / SK9822 ("DotStar") | ❌ | Two-wire **SPI** (clock + data), a different protocol. |
+| WS2801, LPD8806 | ❌ | Also clocked SPI parts, not single-wire. |
+
+**Color-order tip:** the library always sends GRB. For an RGB-order chip
+(⚠️ rows above), build pixels with red and green swapped so they display
+correctly, e.g. `NeoLED::makePixel(g, r, b)` instead of `makePixel(r, g, b)`.
+
 ## Known Issues
 
 - **Limited GPIO Compatibility**: The library defaults to GPIO 21, which is suitable for M5Stack Cardputer. If using other hardware, ensure the chosen GPIO pin supports I2S output.
-- **Static LED Count**: The number of LEDs is set at compile-time via `LED_NUMBER`. Dynamic allocation is planned for a future release.
+- **Static LED Count (default API only)**: The free-function API uses the compile-time `LED_NUMBER`. For a runtime-sized strip, use the `NeoLED::Strip` class, whose `begin(gpio, led_count, port)` allocates its buffer dynamically.
 
 ## Planned Improvements
 
 - **Support for RGBW LEDs**: Add functionality to handle RGBW NeoPixel strips (PixelW struct already defined).
-- **Dynamic LED Count**: Allow changing LED count at runtime without recompilation.
 - **Animation Framework**: Built-in effects like breathing, chase, fade, etc.
+
+> Done in v1.3.0: runtime LED count and multiple parallel I2S channels via the `NeoLED::Strip` class.
 
 ## Debugging Tips
 
