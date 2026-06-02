@@ -1,0 +1,38 @@
+version: "1.4.0"
+description: >
+  Drive WS2812 / NeoPixel (and SK6812, WS2813/15, and clones) LEDs on the ESP32
+  using the I2S peripheral for rock-solid timing under load. Multiple parallel
+  strips (one per I2S channel), multicore-safe, configurable color order, RGBW,
+  brightness, HSV/gamma utilities, and both a C++ and a C API.
+url: "https://github.com/lahirunirmalx/NeoLED"
+repository: "https://github.com/lahirunirmalx/NeoLED.git"
+documentation: "https://github.com/lahirunirmalx/NeoLED#readme"
+issues: "https://github.com/lahirunirmalx/NeoLED/issues"
+license: "MIT"
+
+tags:
+  - led
+  - ws2812
+  - neopixel
+  - sk6812
+  - rgbw
+  - i2s
+  - addressable-led
+
+# Works across ESP-IDF 4.x and 5.x; the source auto-detects the I2S driver.
+dependencies:
+  idf: ">=4.4"
+
+# I2S output is supported on these targets.
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c6
+
+files:
+  exclude:
+    - ".github/**/*"
+    - "test/**/*"
+    - ".pio/**/*"

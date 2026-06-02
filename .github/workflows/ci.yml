@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  host-tests:
+    name: Host unit tests (color utilities)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run color tests
+        run: make -C test
+
+  idf-build:
+    name: ESP-IDF build (${{ matrix.idf }} / ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [v4.4, v5.0, v5.1, v5.2, v5.3]
+        target: [esp32, esp32s3, esp32c3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build component against ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
+          path: test/idf_build

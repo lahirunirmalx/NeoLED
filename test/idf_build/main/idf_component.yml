@@ -1,0 +1,5 @@
+# Pull in the NeoLED component from the repo root via a path dependency, so the
+# build exercises the same component-manager flow registry users get.
+dependencies:
+  neoled:
+    path: ../../..

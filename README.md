@@ -24,27 +24,31 @@ The WS2812 LEDs typically rely on precise timing signals, which can be challengi
 
 ## Installation
 
+### ESP-IDF Component Manager (recommended)
+
+Add the dependency to your project (or run the command):
+
+```bash
+idf.py add-dependency "lahirunirmalx/neoled^1.4.0"
+```
+
+…or copy the folder into your project's `components/` directory. Then:
+
+```cpp
+#include "neoled.h"      // C++ API
+// or
+#include "neoled_c.h"    // C API
+```
+
 ### PlatformIO
 
-1. Copy the `NeoLED` component folder into your project's `lib` or `components` directory.
+Add to `platformio.ini`:
 
-2. Include the library in your source files:
-
-```cpp
-#include "neoled.h"
+```ini
+lib_deps = https://github.com/lahirunirmalx/NeoLED.git
 ```
 
-### ESP-IDF
-
-1. Copy the `NeoLED` component folder into your ESP-IDF project under the `components` directory.
-
-2. The component will be automatically detected and included by the build system.
-
-3. Include the library in your source files:
-
-```cpp
-#include "neoled.h"
-```
+…or copy the folder into your project's `lib/` directory, then `#include "neoled.h"`.
 
 ## Configuration
 
@@ -166,6 +170,38 @@ Notes:
   strips (passing one twice would deadlock its mutex).
 - For per-core rendering, give each core its own `Strip` and task — see
   [`examples/05_multicore`](examples/05_multicore/main.cpp).
+
+### Color order, RGBW & per-pixel API
+
+```cpp
+NeoLED::Strip strip;
+strip.begin(18, 30, /*port=*/0, NeoLED::ORDER_RGB, /*rgbw=*/true);  // WS2811-order RGBW
+
+strip.fill(NeoLED::COLOR_OFF);
+strip.setPixel(0, NeoLED::COLOR_RED);                 // RGB pixel
+strip.setPixelW(1, NeoLED::PixelW{0, 0, 0, 255});     // pure white channel
+strip.show();                                         // render framebuffer + transmit
+```
+
+`setPixel`/`fill`/`fillRange` write the internal framebuffer (build a frame from
+one task), and `show()` renders + transmits. `getPixel(i)` reads it back.
+
+### C API (`neoled_c.h`)
+
+For plain-C projects — handle-based, no C++ required:
+
+```c
+#include "neoled_c.h"
+
+neoled_strip_handle_t s = neoled_strip_create();
+neoled_strip_begin(s, 21, 8, 0);          // gpio, count, i2s_port
+neoled_strip_set_pixel(s, 0, 255, 0, 0);
+neoled_strip_show(s);
+neoled_strip_destroy(s);
+```
+
+See [`examples/06_c_api`](examples/06_c_api/main.c). Int-returning functions give
+`0` on success or a negative error code.
 
 ### Pixel Creation
 
@@ -354,6 +390,15 @@ extern "C" void app_main() {
 
 ## Changelog
 
+### v1.4.0
+- **Configurable color order** (`ORDER_GRB`/`RGB`/`BRG`/`RBG`/`GBR`/`BGR`) per strip — drive WS2811/PL9823/APA106 (RGB-order clones) without swapping channels yourself.
+- **RGBW support** (e.g. SK6812-RGBW): `Strip::begin(..., rgbw=true)`, `updateW()`, `setPixelW()`.
+- **Per-pixel framebuffer API**: `setPixel()`, `setPixelW()`, `getPixel()`, `fill()`, `fillRange()`, `show()` — with bounds checks.
+- **C API** (`neoled_c.h`): handle-based functions so plain-C ESP-IDF projects can use the library without C++.
+- **Deterministic latch**: replaced the config-dependent `vTaskDelay(1)` with `esp_rom_delay_us(280)`, fixing refresh rate and reset timing.
+- **Packaging & CI**: ESP Component Registry manifest (`idf_component.yml`), PlatformIO `library.json`, modernized `CMakeLists.txt`, GitHub Actions building across ESP-IDF 4.4–5.3 × esp32/s3/c3, plus host unit tests for the color math.
+- Backward compatible: the existing C++ free functions and `Strip` calls are unchanged (new `begin()` args are defaulted).
+
 ### v1.3.0
 - **Multiple I2S channels / parallel strips.** New `NeoLED::Strip` class — one instance per data line, each with its own I2S port, frame buffer, brightness, and mutex. Drive several independent strips at once with `NeoLED::updateParallel()` (up to the SoC's I2S peripheral count: 2 on ESP32 / ESP32-S3, 1 on S2/C3/C6/H2).
 - **Multicore-safe.** Each `Strip` is independent and mutex-protected, so different strips can be rendered from tasks pinned to different cores (see `examples/05_multicore`). The default free-function API is now mutex-protected too.
@@ -392,9 +437,9 @@ extern "C" void app_main() {
 
 ## Compatible LED Chips
 
-NeoLED generates a fixed **single-wire ~800 kHz NRZ** signal in **GRB** order,
-3 bytes per pixel. Any addressable LED that speaks that protocol works — these
-are the common WS2812 "clones" and relatives:
+NeoLED generates a **single-wire ~800 kHz NRZ** signal with **configurable
+color order** and optional **RGBW** (4th byte). Any addressable LED that speaks
+that protocol works — these are the common WS2812 "clones" and relatives:
 
 | Chip | Works | Notes |
 |------|-------|-------|
@@ -403,16 +448,16 @@ are the common WS2812 "clones" and relatives:
 | WS2815 | ✅ | 12 V strip, same data timing/order — just power it from 12 V. |
 | SK6812 (RGB) | ✅ | WS2812-compatible timing and GRB order. |
 | SK6805 | ✅ | Smaller SK6812 family member. |
-| WS2811 | ⚠️ | 800 kHz mode usually works, but many are **RGB** order — swap R/G (below). |
-| PL9823 | ⚠️ | 800 kHz single-wire, but **RGB** order — swap R/G. |
-| APA106 | ⚠️ | Through-hole, **RGB** order — swap R/G. |
-| SK6812-**RGBW** | ❌ | 4 bytes/pixel (W channel) — not supported yet (RGB only). |
+| WS2811 | ✅ | 800 kHz mode. Usually **RGB** order — pass `ORDER_RGB` to `begin()`. |
+| PL9823 | ✅ | 800 kHz single-wire, **RGB** order — pass `ORDER_RGB`. |
+| APA106 | ✅ | Through-hole, **RGB** order — pass `ORDER_RGB`. |
+| SK6812-**RGBW** | ✅ | Pass `rgbw=true` to `begin()`; use `updateW()` / `setPixelW()`. |
 | APA102 / SK9822 ("DotStar") | ❌ | Two-wire **SPI** (clock + data), a different protocol. |
 | WS2801, LPD8806 | ❌ | Also clocked SPI parts, not single-wire. |
 
-**Color-order tip:** the library always sends GRB. For an RGB-order chip
-(⚠️ rows above), build pixels with red and green swapped so they display
-correctly, e.g. `NeoLED::makePixel(g, r, b)` instead of `makePixel(r, g, b)`.
+**Color order:** pick the order that matches your chip at `begin()` time
+(default `ORDER_GRB`); the library stores logical R/G/B and reorders on the
+wire, so your `makePixel(r, g, b)` values are always correct.
 
 ## Known Issues
 
@@ -421,10 +466,11 @@ correctly, e.g. `NeoLED::makePixel(g, r, b)` instead of `makePixel(r, g, b)`.
 
 ## Planned Improvements
 
-- **Support for RGBW LEDs**: Add functionality to handle RGBW NeoPixel strips (PixelW struct already defined).
 - **Animation Framework**: Built-in effects like breathing, chase, fade, etc.
+- **Non-blocking / double-buffered updates** for high-FPS animation.
 
 > Done in v1.3.0: runtime LED count and multiple parallel I2S channels via the `NeoLED::Strip` class.
+> Done in v1.4.0: configurable color order, RGBW, per-pixel API, and a C API.
 
 ## Debugging Tips
 

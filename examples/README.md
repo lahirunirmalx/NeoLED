@@ -10,6 +10,7 @@ project (or copy into your own `main.cpp`).
 | [`03_matrix`](03_matrix/main.cpp) | An 8×8 matrix with a serpentine `xy()` mapping and a scrolling HSV rainbow. |
 | [`04_parallel_strips`](04_parallel_strips/main.cpp) | Two **independent** strips on the two I2S ports, refreshed together with `updateParallel()`. |
 | [`05_multicore`](05_multicore/main.cpp) | One strip per CPU core — a `NeoLED::Strip` instance driven from a task pinned to each core. |
+| [`06_c_api`](06_c_api/main.c) | Plain-**C** project using `neoled_c.h` — the handle-based C API, no C++ required. |
 
 ## Building one
 

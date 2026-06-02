@@ -1,0 +1,26 @@
+{
+  "name": "NeoLED",
+  "version": "1.4.0",
+  "description": "WS2812/NeoPixel (and SK6812, WS2813/15, clones) driver for ESP32 using the I2S peripheral for reliable timing under load. Multiple parallel strips, multicore-safe, configurable color order, RGBW, brightness, HSV/gamma utilities, C++ and C APIs.",
+  "keywords": "ws2812, neopixel, sk6812, rgbw, i2s, esp32, addressable-led, led-strip",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lahirunirmalx/NeoLED.git"
+  },
+  "authors": [
+    { "name": "Vu Nam", "url": "https://github.com/vunam" },
+    { "name": "lahirunirmalx", "url": "https://github.com/lahirunirmalx", "maintainer": true }
+  ],
+  "license": "MIT",
+  "frameworks": "espidf",
+  "platforms": "espressif32",
+  "headers": ["neoled.h", "neoled_c.h"],
+  "export": {
+    "exclude": [".github", "test", ".pio", "*.txt"]
+  },
+  "build": {
+    "srcDir": ".",
+    "srcFilter": ["+<neoled.cpp>", "+<neoled_c.cpp>"],
+    "includeDir": "include"
+  }
+}

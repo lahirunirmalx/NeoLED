@@ -31,6 +31,7 @@
 #include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"   // esp_rom_delay_us()
 #include "driver/gpio.h"
 #include "neoled.h"
 
@@ -55,9 +56,12 @@ namespace NeoLED {
 // Bit patterns for WS2812 timing via I2S (2 LED bits per byte).
 static const uint16_t bitpatterns[4] = {0x88, 0x8e, 0xe8, 0xee};
 
-// Reset/latch buffer is the same (all zeros) for every strip, so it can be
-// shared read-only across instances.
+// Reset/latch buffer (all zeros), shared read-only across instances.
 static const uint8_t off_buffer[ZERO_BUFFER] = {0};
+
+// WS2812 reset/latch time. The datasheet minimum is ~50 us; >= 280 us is the
+// safe figure used by most drivers and works for WS2813/SK6812 too.
+static const uint32_t LATCH_US = 280;
 
 // Number of usable I2S ports on this SoC.
 #if NEOLED_USE_NEW_I2S_DRIVER
@@ -74,35 +78,42 @@ static const uint32_t NEOLED_DMA_LEN_MAX = 1020;
 // ============================================================================
 
 /**
- * @brief Convert one pixel into its 12-byte I2S bit-pattern representation.
- * @param pixel      Source pixel.
- * @param buffer     Output buffer (must hold at least PIXEL_SIZE bytes).
- * @param brightness Brightness multiplier (0-255).
+ * @brief Encode one 8-bit color value into 4 I2S bytes (2 LED bits each).
  */
-static void pixelToBitPattern(const Pixel& pixel, uint8_t* buffer, uint8_t brightness)
+static inline void encodeByte(uint8_t value, uint8_t* dst)
 {
-    // Apply brightness
-    uint8_t r = (uint8_t)((pixel.red * brightness) / 255);
-    uint8_t g = (uint8_t)((pixel.green * brightness) / 255);
-    uint8_t b = (uint8_t)((pixel.blue * brightness) / 255);
+    dst[0] = bitpatterns[(value >> 6) & 0x03];
+    dst[1] = bitpatterns[(value >> 4) & 0x03];
+    dst[2] = bitpatterns[(value >> 2) & 0x03];
+    dst[3] = bitpatterns[value & 0x03];
+}
 
-    // Green first (WS2812 uses GRB format)
-    buffer[0] = bitpatterns[(g >> 6) & 0x03];
-    buffer[1] = bitpatterns[(g >> 4) & 0x03];
-    buffer[2] = bitpatterns[(g >> 2) & 0x03];
-    buffer[3] = bitpatterns[g & 0x03];
+static inline uint8_t scale8(uint8_t value, uint8_t brightness)
+{
+    return (uint8_t)(((uint16_t)value * brightness) / 255);
+}
 
-    // Red
-    buffer[4] = bitpatterns[(r >> 6) & 0x03];
-    buffer[5] = bitpatterns[(r >> 4) & 0x03];
-    buffer[6] = bitpatterns[(r >> 2) & 0x03];
-    buffer[7] = bitpatterns[r & 0x03];
-
-    // Blue
-    buffer[8]  = bitpatterns[(b >> 6) & 0x03];
-    buffer[9]  = bitpatterns[(b >> 4) & 0x03];
-    buffer[10] = bitpatterns[(b >> 2) & 0x03];
-    buffer[11] = bitpatterns[b & 0x03];
+/**
+ * @brief Arrange brightness-scaled r/g/b into wire order, append white if RGBW.
+ * @return number of channel bytes written to wire[].
+ */
+static inline uint8_t toWireOrder(uint8_t r, uint8_t g, uint8_t b, uint8_t w,
+                                  ColorOrder order, bool rgbw, uint8_t* wire)
+{
+    switch (order) {
+        case ORDER_RGB: wire[0] = r; wire[1] = g; wire[2] = b; break;
+        case ORDER_BRG: wire[0] = b; wire[1] = r; wire[2] = g; break;
+        case ORDER_RBG: wire[0] = r; wire[1] = b; wire[2] = g; break;
+        case ORDER_GBR: wire[0] = g; wire[1] = b; wire[2] = r; break;
+        case ORDER_BGR: wire[0] = b; wire[1] = g; wire[2] = r; break;
+        case ORDER_GRB:
+        default:        wire[0] = g; wire[1] = r; wire[2] = b; break;
+    }
+    if (rgbw) {
+        wire[3] = w;  // white is always last
+        return 4;
+    }
+    return 3;
 }
 
 namespace {
@@ -132,6 +143,9 @@ Strip::Strip()
       gpio_(I2S_DO_IO),
       led_count_(0),
       size_buffer_(0),
+      channels_(3),
+      order_(ORDER_GRB),
+      logical_(nullptr),
       out_buffer_(nullptr),
       brightness_(255),
       initialized_(false),
@@ -149,9 +163,9 @@ Strip::~Strip()
     }
 }
 
-neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
+neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port,
+                          ColorOrder order, bool rgbw)
 {
-    // Create the mutex on first use (kept for the lifetime of the object).
     if (!mutex_) {
         mutex_ = xSemaphoreCreateMutex();
         if (!mutex_) {
@@ -164,14 +178,12 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
 
     if (initialized_) {
         ESP_LOGW(TAG, "Already initialized, call end() first");
-        return NEOLED_OK;  // Already initialized is not an error
+        return NEOLED_OK;
     }
-
     if (led_count == 0) {
         ESP_LOGE(TAG, "led_count must be >= 1");
         return NEOLED_ERR_PARAM;
     }
-
     if (i2s_port < 0 || i2s_port >= NEOLED_I2S_PORT_COUNT) {
         ESP_LOGE(TAG, "Invalid I2S port %d (this SoC has %d)", i2s_port, (int)NEOLED_I2S_PORT_COUNT);
         return NEOLED_ERR_PARAM;
@@ -180,11 +192,16 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     port_        = i2s_port;
     gpio_        = gpio_pin;
     led_count_   = led_count;
-    size_buffer_ = (uint16_t)(led_count * PIXEL_SIZE);
+    order_       = order;
+    channels_    = rgbw ? 4 : 3;
+    size_buffer_ = (uint16_t)(led_count * channels_ * 4);
 
+    logical_    = (uint8_t*)calloc(led_count, channels_);
     out_buffer_ = (uint8_t*)malloc(size_buffer_);
-    if (!out_buffer_) {
-        ESP_LOGE(TAG, "Failed to allocate %u byte frame buffer", (unsigned)size_buffer_);
+    if (!logical_ || !out_buffer_) {
+        ESP_LOGE(TAG, "Failed to allocate strip buffers");
+        free(logical_);    logical_ = nullptr;
+        free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_NO_MEM;
     }
 
@@ -194,7 +211,6 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     esp_err_t ret;
 
 #if NEOLED_USE_NEW_I2S_DRIVER
-    // ESP-IDF 5.x: New I2S driver initialization
     i2s_chan_config_t chan_cfg = {
         .id = (i2s_port_t)port_,
         .role = I2S_ROLE_MASTER,
@@ -207,6 +223,7 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     ret = i2s_new_channel(&chan_cfg, &handle, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create I2S channel: %s", esp_err_to_name(ret));
+        free(logical_); logical_ = nullptr;
         free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
@@ -247,6 +264,7 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init I2S channel: %s", esp_err_to_name(ret));
         i2s_del_channel(handle);
+        free(logical_); logical_ = nullptr;
         free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
@@ -255,13 +273,13 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable I2S channel: %s", esp_err_to_name(ret));
         i2s_del_channel(handle);
+        free(logical_); logical_ = nullptr;
         free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 
     tx_handle_ = handle;
 #else
-    // ESP-IDF 4.x: Legacy I2S driver initialization
     i2s_config_t i2s_config = {
         .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = SAMPLE_RATE,
@@ -295,6 +313,7 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     ret = i2s_driver_install(static_cast<i2s_port_t>(port_), &i2s_config, 0, nullptr);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install I2S driver: %s", esp_err_to_name(ret));
+        free(logical_); logical_ = nullptr;
         free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
@@ -303,20 +322,19 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set I2S pins: %s", esp_err_to_name(ret));
         i2s_driver_uninstall(static_cast<i2s_port_t>(port_));
+        free(logical_); logical_ = nullptr;
         free(out_buffer_); out_buffer_ = nullptr;
         return NEOLED_ERR_I2S;
     }
 #endif
 
     initialized_ = true;
-    ESP_LOGI(TAG, "Initialized I2S%d on GPIO %d, %u LEDs", port_, gpio_pin, (unsigned)led_count_);
+    ESP_LOGI(TAG, "Initialized I2S%d on GPIO %d, %u LEDs (%s, order %d)",
+             port_, gpio_pin, (unsigned)led_count_, channels_ == 4 ? "RGBW" : "RGB", (int)order_);
 
-    // Clear LEDs on init (we already hold the lock, so fill+transmit directly).
+    // Clear LEDs on init (all-zero pixel encodes to bitpatterns[0]).
     memset(out_buffer_, bitpatterns[0], size_buffer_);
-    writeData();
-    writeReset();
-    vTaskDelay(pdMS_TO_TICKS(1));
-    zeroDma();
+    transmit();
 
     return NEOLED_OK;
 }
@@ -326,15 +344,11 @@ neoled_err_t Strip::end(void)
     LockGuard lg(mutex_);
 
     if (!initialized_) {
-        return NEOLED_OK;  // Not an error to end when not initialized
+        return NEOLED_OK;
     }
 
-    // Turn off LEDs before tearing down.
     memset(out_buffer_, bitpatterns[0], size_buffer_);
-    writeData();
-    writeReset();
-    vTaskDelay(pdMS_TO_TICKS(1));
-    zeroDma();
+    transmit();
 
     esp_err_t ret;
 
@@ -360,10 +374,8 @@ neoled_err_t Strip::end(void)
 
     gpio_reset_pin(static_cast<gpio_num_t>(gpio_));
 
-    if (out_buffer_) {
-        free(out_buffer_);
-        out_buffer_ = nullptr;
-    }
+    free(logical_);    logical_ = nullptr;
+    free(out_buffer_); out_buffer_ = nullptr;
     size_buffer_ = 0;
     initialized_ = false;
     ESP_LOGI(TAG, "Strip on I2S%d destroyed", port_);
@@ -372,15 +384,37 @@ neoled_err_t Strip::end(void)
 }
 
 // ============================================================================
-// Strip — rendering
+// Strip — rendering pipeline
 // ============================================================================
 
-neoled_err_t Strip::fillBuffer(const Pixel* pixels, uint8_t brightness)
+void Strip::copyLogical(const Pixel* pixels)
 {
     for (uint16_t i = 0; i < led_count_; i++) {
-        pixelToBitPattern(pixels[i], &out_buffer_[i * PIXEL_SIZE], brightness);
+        uint8_t* dst = &logical_[i * channels_];
+        dst[0] = pixels[i].red;
+        dst[1] = pixels[i].green;
+        dst[2] = pixels[i].blue;
+        if (channels_ == 4) dst[3] = 0;  // update(Pixel*) leaves white off
     }
-    return NEOLED_OK;
+}
+
+void Strip::render(uint8_t brightness)
+{
+    uint8_t wire[4];
+    bool rgbw = (channels_ == 4);
+    for (uint16_t i = 0; i < led_count_; i++) {
+        const uint8_t* src = &logical_[i * channels_];
+        uint8_t r = scale8(src[0], brightness);
+        uint8_t g = scale8(src[1], brightness);
+        uint8_t b = scale8(src[2], brightness);
+        uint8_t w = rgbw ? scale8(src[3], brightness) : 0;
+
+        uint8_t n = toWireOrder(r, g, b, w, order_, rgbw, wire);
+        uint8_t* dst = &out_buffer_[i * channels_ * 4];
+        for (uint8_t c = 0; c < n; c++) {
+            encodeByte(wire[c], &dst[c * 4]);
+        }
+    }
 }
 
 neoled_err_t Strip::writeData(void)
@@ -426,6 +460,21 @@ void Strip::zeroDma(void)
 #endif
 }
 
+neoled_err_t Strip::transmit(void)
+{
+    neoled_err_t e = writeData();
+    if (e != NEOLED_OK) return e;
+    e = writeReset();
+    if (e != NEOLED_OK) return e;
+    esp_rom_delay_us(LATCH_US);  // deterministic WS2812 reset/latch
+    zeroDma();
+    return NEOLED_OK;
+}
+
+// ============================================================================
+// Strip — whole-frame updates
+// ============================================================================
+
 neoled_err_t Strip::update(const Pixel* pixels)
 {
     return updateWithBrightness(pixels, brightness_);
@@ -434,55 +483,122 @@ neoled_err_t Strip::update(const Pixel* pixels)
 neoled_err_t Strip::updateWithBrightness(const Pixel* pixels, uint8_t brightness)
 {
     LockGuard lg(mutex_);
+    if (!initialized_) { ESP_LOGE(TAG, "Not initialized"); return NEOLED_ERR_NOT_INIT; }
+    if (pixels == nullptr) { ESP_LOGE(TAG, "Null pixel pointer"); return NEOLED_ERR_PARAM; }
 
-    if (!initialized_) {
-        ESP_LOGE(TAG, "Not initialized");
-        return NEOLED_ERR_NOT_INIT;
+    copyLogical(pixels);
+    render(brightness);
+    return transmit();
+}
+
+neoled_err_t Strip::updateW(const PixelW* pixels)
+{
+    LockGuard lg(mutex_);
+    if (!initialized_) { ESP_LOGE(TAG, "Not initialized"); return NEOLED_ERR_NOT_INIT; }
+    if (pixels == nullptr) { ESP_LOGE(TAG, "Null pixel pointer"); return NEOLED_ERR_PARAM; }
+
+    for (uint16_t i = 0; i < led_count_; i++) {
+        uint8_t* dst = &logical_[i * channels_];
+        dst[0] = pixels[i].red;
+        dst[1] = pixels[i].green;
+        dst[2] = pixels[i].blue;
+        if (channels_ == 4) dst[3] = pixels[i].white;
     }
-    if (pixels == nullptr) {
-        ESP_LOGE(TAG, "Null pixel pointer");
-        return NEOLED_ERR_PARAM;
-    }
-
-    fillBuffer(pixels, brightness);
-
-    neoled_err_t e = writeData();
-    if (e != NEOLED_OK) return e;
-    e = writeReset();
-    if (e != NEOLED_OK) return e;
-
-    vTaskDelay(pdMS_TO_TICKS(1));  // data latch
-    zeroDma();
-    return NEOLED_OK;
+    render(brightness_);
+    return transmit();
 }
 
 neoled_err_t Strip::clear(void)
 {
     LockGuard lg(mutex_);
+    if (!initialized_) return NEOLED_ERR_NOT_INIT;
 
-    if (!initialized_) {
-        return NEOLED_ERR_NOT_INIT;
-    }
+    memset(logical_, 0, (size_t)led_count_ * channels_);
+    memset(out_buffer_, bitpatterns[0], size_buffer_);  // all-zero pixel
+    return transmit();
+}
 
-    // An all-zero pixel encodes to bitpatterns[0] for every byte.
-    memset(out_buffer_, bitpatterns[0], size_buffer_);
+// ============================================================================
+// Strip — per-pixel framebuffer API
+// ============================================================================
 
-    neoled_err_t e = writeData();
-    if (e != NEOLED_OK) return e;
-    e = writeReset();
-    if (e != NEOLED_OK) return e;
-
-    vTaskDelay(pdMS_TO_TICKS(1));
-    zeroDma();
+neoled_err_t Strip::setPixel(uint16_t index, const Pixel& color)
+{
+    if (!initialized_ || index >= led_count_) return NEOLED_ERR_PARAM;
+    uint8_t* dst = &logical_[index * channels_];
+    dst[0] = color.red;
+    dst[1] = color.green;
+    dst[2] = color.blue;
     return NEOLED_OK;
 }
 
-bool     Strip::isInitialized(void) const { return initialized_; }
-void     Strip::setBrightness(uint8_t b)  { brightness_ = b; }
-uint8_t  Strip::getBrightness(void) const { return brightness_; }
-uint16_t Strip::numLeds(void) const       { return led_count_; }
-int      Strip::getGpioPin(void) const    { return gpio_; }
-int      Strip::getPort(void) const       { return port_; }
+neoled_err_t Strip::setPixelW(uint16_t index, const PixelW& color)
+{
+    if (!initialized_ || index >= led_count_) return NEOLED_ERR_PARAM;
+    uint8_t* dst = &logical_[index * channels_];
+    dst[0] = color.red;
+    dst[1] = color.green;
+    dst[2] = color.blue;
+    if (channels_ == 4) dst[3] = color.white;
+    return NEOLED_OK;
+}
+
+Pixel Strip::getPixel(uint16_t index) const
+{
+    Pixel p = {0, 0, 0};
+    if (!initialized_ || index >= led_count_) return p;
+    const uint8_t* src = &logical_[index * channels_];
+    p.red = src[0];
+    p.green = src[1];
+    p.blue = src[2];
+    return p;
+}
+
+void Strip::fill(const Pixel& color)
+{
+    if (!initialized_) return;
+    for (uint16_t i = 0; i < led_count_; i++) {
+        uint8_t* dst = &logical_[i * channels_];
+        dst[0] = color.red;
+        dst[1] = color.green;
+        dst[2] = color.blue;
+    }
+}
+
+neoled_err_t Strip::fillRange(uint16_t start, uint16_t count, const Pixel& color)
+{
+    if (!initialized_ || start >= led_count_) return NEOLED_ERR_PARAM;
+    uint16_t end = start + count;
+    if (end > led_count_) end = led_count_;
+    for (uint16_t i = start; i < end; i++) {
+        uint8_t* dst = &logical_[i * channels_];
+        dst[0] = color.red;
+        dst[1] = color.green;
+        dst[2] = color.blue;
+    }
+    return NEOLED_OK;
+}
+
+neoled_err_t Strip::show(void)
+{
+    LockGuard lg(mutex_);
+    if (!initialized_) return NEOLED_ERR_NOT_INIT;
+    render(brightness_);
+    return transmit();
+}
+
+// ============================================================================
+// Strip — accessors
+// ============================================================================
+
+bool       Strip::isInitialized(void) const { return initialized_; }
+void       Strip::setBrightness(uint8_t b)   { brightness_ = b; }
+uint8_t    Strip::getBrightness(void) const  { return brightness_; }
+uint16_t   Strip::numLeds(void) const        { return led_count_; }
+int        Strip::getGpioPin(void) const     { return gpio_; }
+int        Strip::getPort(void) const        { return port_; }
+ColorOrder Strip::getColorOrder(void) const  { return order_; }
+bool       Strip::isRGBW(void) const         { return channels_ == 4; }
 
 // ============================================================================
 // Parallel multi-strip update
@@ -494,8 +610,6 @@ neoled_err_t updateParallel(Strip* const* strips, const Pixel* const* pixels, ui
         return NEOLED_ERR_PARAM;
     }
 
-    // Take every strip's lock up front (consistent order avoids deadlock when
-    // callers always pass strips in the same order).
     for (uint8_t i = 0; i < count; i++) {
         if (!strips[i]) return NEOLED_ERR_PARAM;
         if (strips[i]->mutex_) {
@@ -509,11 +623,11 @@ neoled_err_t updateParallel(Strip* const* strips, const Pixel* const* pixels, ui
     for (uint8_t i = 0; i < count; i++) {
         if (!strips[i]->initialized_) { result = NEOLED_ERR_NOT_INIT; break; }
         if (!pixels[i])               { result = NEOLED_ERR_PARAM;    break; }
-        strips[i]->fillBuffer(pixels[i], strips[i]->brightness_);
+        strips[i]->copyLogical(pixels[i]);
+        strips[i]->render(strips[i]->brightness_);
     }
 
-    // Phase 2: kick the DMA writes back-to-back. Each i2s write returns once
-    // the data is queued, so the peripherals transmit concurrently.
+    // Phase 2: kick the DMA writes back-to-back so peripherals overlap.
     if (result == NEOLED_OK) {
         for (uint8_t i = 0; i < count; i++) {
             neoled_err_t e = strips[i]->writeData();
@@ -523,14 +637,12 @@ neoled_err_t updateParallel(Strip* const* strips, const Pixel* const* pixels, ui
             neoled_err_t e = strips[i]->writeReset();
             if (e != NEOLED_OK) result = e;
         }
-        // A single latch delay covers all strips (they ran in parallel).
-        vTaskDelay(pdMS_TO_TICKS(1));
+        esp_rom_delay_us(LATCH_US);  // one latch covers all (ran in parallel)
         for (uint8_t i = 0; i < count; i++) {
             strips[i]->zeroDma();
         }
     }
 
-    // Release locks in reverse order.
     for (int i = (int)count - 1; i >= 0; i--) {
         if (strips[i]->mutex_) {
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(strips[i]->mutex_));
@@ -636,12 +748,10 @@ Pixel gammaCorrect(const Pixel& pixel, float gamma)
     Pixel result;
 
     if (gamma == 2.2f) {
-        // Use lookup table for common gamma value
         result.red = gamma22_table[pixel.red];
         result.green = gamma22_table[pixel.green];
         result.blue = gamma22_table[pixel.blue];
     } else {
-        // Calculate gamma for custom values
         result.red = (uint8_t)(powf(pixel.red / 255.0f, gamma) * 255.0f + 0.5f);
         result.green = (uint8_t)(powf(pixel.green / 255.0f, gamma) * 255.0f + 0.5f);
         result.blue = (uint8_t)(powf(pixel.blue / 255.0f, gamma) * 255.0f + 0.5f);

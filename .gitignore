@@ -67,3 +67,12 @@ dependencies.lock
 .vscode/
 .idea/
 .DS_Store
+
+# Host unit-test binary
+/test/test_color
+
+# ESP-IDF build-test project artifacts
+/test/idf_build/build/
+/test/idf_build/managed_components/
+/test/idf_build/dependencies.lock
+/test/idf_build/sdkconfig

@@ -1,35 +1,20 @@
-# NeoLED ESP-IDF Component CMakeLists.txt
+# NeoLED ESP-IDF Component
 # Compatible with ESP-IDF 4.x and 5.x
 
-# Component source files
-set(COMPONENT_SRCS 
-    "neoled.cpp"
-)
-
-# Include directories
-set(COMPONENT_ADD_INCLUDEDIRS 
-    "include"
-)
-
-# Required ESP-IDF components
-set(COMPONENT_PRIV_REQUIRES 
-    driver 
-    freertos
-    esp_log
-)
-
-# C++ standard
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Register the component
 idf_component_register(
-    SRCS ${COMPONENT_SRCS}
-    INCLUDE_DIRS ${COMPONENT_ADD_INCLUDEDIRS}
-    PRIV_REQUIRES ${COMPONENT_PRIV_REQUIRES}
+    SRCS "neoled.cpp"
+         "neoled_c.cpp"
+    INCLUDE_DIRS "include"
+    PRIV_REQUIRES driver freertos esp_rom esp_log
 )
 
-# Optional: Enable extra warnings for development
+# The library targets C++11.
+set_target_properties(${COMPONENT_LIB} PROPERTIES
+    CXX_STANDARD 11
+    CXX_STANDARD_REQUIRED ON
+)
+
+# Extra warnings for development builds.
 if(CONFIG_COMPILER_WARN_WRITE_STRINGS)
-    target_compile_options(${COMPONENT_LIB} PRIVATE -Wextra -Wpedantic)
+    target_compile_options(${COMPONENT_LIB} PRIVATE -Wextra)
 endif()

@@ -28,15 +28,20 @@
 
 // Library version
 #define NEOLED_VERSION_MAJOR 1
-#define NEOLED_VERSION_MINOR 3
+#define NEOLED_VERSION_MINOR 4
 #define NEOLED_VERSION_PATCH 0
-#define NEOLED_VERSION_STRING "1.3.0"
+#define NEOLED_VERSION_STRING "1.4.0"
 
-// ESP-IDF version detection for compatibility
-#include "esp_idf_version.h"
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-    #define NEOLED_USE_NEW_I2S_DRIVER 1
+// ESP-IDF version detection for compatibility.
+// Guarded by ESP_PLATFORM (defined by the ESP-IDF build) so this header can
+// also be included on a host for unit-testing the pure color utilities.
+#ifdef ESP_PLATFORM
+    #include "esp_idf_version.h"
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+        #define NEOLED_USE_NEW_I2S_DRIVER 1
+    #else
+        #define NEOLED_USE_NEW_I2S_DRIVER 0
+    #endif
 #else
     #define NEOLED_USE_NEW_I2S_DRIVER 0
 #endif
@@ -99,7 +104,7 @@ typedef struct {
 } Pixel;
 
 /**
- * @brief Extended pixel structure for RGBW LEDs (future use)
+ * @brief Extended pixel structure for RGBW LEDs
  */
 typedef struct {
     uint8_t green;
@@ -107,6 +112,27 @@ typedef struct {
     uint8_t blue;
     uint8_t white;
 } PixelW;
+
+// ============================================================================
+// Color order
+// ============================================================================
+
+/**
+ * @brief Wire color order of the RGB triplet sent to the LEDs.
+ *
+ * The library stores logical R/G/B and reorders at transmit time, so the same
+ * Pixel/makePixel() values look correct on any chip — just pick the order that
+ * matches your part. WS2812/SK6812 are GRB (the default); many WS2811/PL9823/
+ * APA106 clones are RGB. For RGBW strips the white byte is always sent last.
+ */
+typedef enum {
+    ORDER_GRB = 0,  // WS2812, WS2813, WS2815, SK6812 (default)
+    ORDER_RGB,      // WS2811, PL9823, APA106 (common)
+    ORDER_BRG,
+    ORDER_RBG,
+    ORDER_GBR,
+    ORDER_BGR
+} ColorOrder;
 
 // ============================================================================
 // Predefined Colors (values given in {green, red, blue} GRB storage order)
@@ -260,44 +286,66 @@ public:
      * @param gpio_pin  Data output GPIO.
      * @param led_count Number of LEDs on this strip (must be >= 1).
      * @param i2s_port  I2S peripheral index (defaults to I2S_NUM).
+     * @param order     Wire color order (defaults to ORDER_GRB for WS2812).
+     * @param rgbw      true for RGBW chips (e.g. SK6812-RGBW); false for RGB.
      * @return NEOLED_OK, or NEOLED_ERR_PARAM / NEOLED_ERR_NO_MEM / NEOLED_ERR_I2S.
      */
-    neoled_err_t begin(int gpio_pin, uint16_t led_count, int i2s_port = I2S_NUM);
+    neoled_err_t begin(int gpio_pin, uint16_t led_count, int i2s_port = I2S_NUM,
+                       ColorOrder order = ORDER_GRB, bool rgbw = false);
 
     /** @brief Release the I2S channel and frame buffer, and reset the GPIO. */
     neoled_err_t end(void);
 
     bool isInitialized(void) const;
 
+    // ---- Whole-frame updates (render an external array + transmit) ----
     neoled_err_t update(const Pixel* pixels);
     neoled_err_t updateWithBrightness(const Pixel* pixels, uint8_t brightness);
+    neoled_err_t updateW(const PixelW* pixels);  // RGBW strips
     neoled_err_t clear(void);
 
-    void     setBrightness(uint8_t brightness);
-    uint8_t  getBrightness(void) const;
-    uint16_t numLeds(void) const;
-    int      getGpioPin(void) const;
-    int      getPort(void) const;
+    // ---- Per-pixel framebuffer API ----
+    // setPixel()/fill() write the internal framebuffer; nothing is sent until
+    // show(). Build a frame from a single task, then call show().
+    neoled_err_t setPixel(uint16_t index, const Pixel& color);
+    neoled_err_t setPixelW(uint16_t index, const PixelW& color);
+    Pixel        getPixel(uint16_t index) const;
+    void         fill(const Pixel& color);
+    neoled_err_t fillRange(uint16_t start, uint16_t count, const Pixel& color);
+    neoled_err_t show(void);  // render the framebuffer + transmit
+
+    void       setBrightness(uint8_t brightness);
+    uint8_t    getBrightness(void) const;
+    uint16_t   numLeds(void) const;
+    int        getGpioPin(void) const;
+    int        getPort(void) const;
+    ColorOrder getColorOrder(void) const;
+    bool       isRGBW(void) const;
 
 private:
-    neoled_err_t fillBuffer(const Pixel* pixels, uint8_t brightness);
+    void         copyLogical(const Pixel* pixels);
+    void         render(uint8_t brightness);  // logical framebuffer -> out_buffer_
     neoled_err_t writeData(void);
     neoled_err_t writeReset(void);
     void         zeroDma(void);
+    neoled_err_t transmit(void);              // writeData + writeReset + latch
 
     friend neoled_err_t updateParallel(Strip* const* strips,
                                        const Pixel* const* pixels,
                                        uint8_t count);
 
-    int      port_;
-    int      gpio_;
-    uint16_t led_count_;
-    uint16_t size_buffer_;
-    uint8_t* out_buffer_;
-    uint8_t  brightness_;
-    bool     initialized_;
-    void*    mutex_;       // SemaphoreHandle_t (opaque to keep header light)
-    void*    tx_handle_;   // i2s_chan_handle_t on ESP-IDF 5.x; unused on 4.x
+    int        port_;
+    int        gpio_;
+    uint16_t   led_count_;
+    uint16_t   size_buffer_;   // out_buffer_ size in bytes
+    uint8_t    channels_;      // 3 (RGB) or 4 (RGBW)
+    ColorOrder order_;
+    uint8_t*   logical_;       // led_count_ * channels_ raw color bytes
+    uint8_t*   out_buffer_;    // encoded I2S bit patterns
+    uint8_t    brightness_;
+    bool       initialized_;
+    void*      mutex_;         // SemaphoreHandle_t (opaque to keep header light)
+    void*      tx_handle_;     // i2s_chan_handle_t on ESP-IDF 5.x; unused on 4.x
 };
 
 /**
