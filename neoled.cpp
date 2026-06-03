@@ -228,26 +228,15 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port,
         return NEOLED_ERR_I2S;
     }
 
+    // Use the official default-config macros for clk_cfg and slot_cfg. They
+    // expand to exactly the Philips-standard 16-bit stereo settings this driver
+    // needs, and crucially they handle the SoC-dependent slot fields
+    // (msb_right on I2S HW v1 / ESP32-S2 vs left_align/big_endian/bit_order_lsb
+    // on HW v2) which differ between targets.
     i2s_std_config_t std_cfg = {
-        .clk_cfg = {
-            .sample_rate_hz = SAMPLE_RATE,
-            .clk_src = I2S_CLK_SRC_DEFAULT,
-            // The new I2S driver enum has no _DEFAULT; MCLK is unused for
-            // WS2812 output anyway, so any valid multiple works.
-            .mclk_multiple = I2S_MCLK_MULTIPLE_256
-        },
-        .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
-            .slot_mode = I2S_SLOT_MODE_STEREO,
-            .slot_mask = I2S_STD_SLOT_BOTH,
-            .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .ws_pol = false,
-            .bit_shift = true,
-            .left_align = false,
-            .big_endian = false,
-            .bit_order_lsb = false
-        },
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = I2S_GPIO_UNUSED,
