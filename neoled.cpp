@@ -232,7 +232,9 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port,
         .clk_cfg = {
             .sample_rate_hz = SAMPLE_RATE,
             .clk_src = I2S_CLK_SRC_DEFAULT,
-            .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT
+            // The new I2S driver enum has no _DEFAULT; MCLK is unused for
+            // WS2812 output anyway, so any valid multiple works.
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256
         },
         .slot_cfg = {
             .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
@@ -294,10 +296,12 @@ neoled_err_t Strip::begin(int gpio_pin, uint16_t led_count, int i2s_port,
         .dma_buf_count = 4,
         .dma_buf_len = (int)dma_len,
         .use_apll = false,
+        // Field order must match the struct declaration for C++ designated
+        // initializers: tx_desc_auto_clear precedes mclk_multiple in 4.x.
+        .tx_desc_auto_clear = true,
     #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-        .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT
     #endif
-        .tx_desc_auto_clear = true
     };
 
     i2s_pin_config_t pin_config = {
