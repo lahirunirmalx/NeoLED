@@ -5,7 +5,10 @@ idf_component_register(
     SRCS "neoled.cpp"
          "neoled_c.cpp"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES driver freertos esp_rom esp_log
+    # 'driver' covers I2S + GPIO on both ESP-IDF 4.x and 5.x. freertos, log and
+    # esp_rom (used for esp_rom_delay_us) are common components, automatically
+    # available to every component, so they are not listed here.
+    PRIV_REQUIRES driver
 )
 
 # The library targets C++11.

@@ -7,5 +7,6 @@ idf_component_register(
     SRCS "${NEOLED_ROOT}/neoled.cpp"
          "${NEOLED_ROOT}/neoled_c.cpp"
     INCLUDE_DIRS "${NEOLED_ROOT}/include"
-    PRIV_REQUIRES driver freertos esp_rom esp_log
+    # 'driver' covers I2S + GPIO; freertos/log/esp_rom are common components.
+    PRIV_REQUIRES driver
 )
